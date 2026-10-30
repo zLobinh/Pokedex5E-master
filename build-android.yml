@@ -1,0 +1,122 @@
+# Build do APK de Android na nuvem (GitHub Actions), sem precisar do
+# servidor de build oficial do Defold, que não aceita mais o Defold 1.9.6.
+#
+# O que acontece aqui, numa máquina Linux emprestada pelo GitHub:
+#   1. sobe uma cópia do servidor de build do Defold (extender) no Docker
+#   2. ensina esse servidor a atender o pedido "android-ndk25" do 1.9.6
+#      usando a máquina "android-ndk25_sdk36" (mesmo NDK 25)
+#   3. monta o APK com o bob.jar do Defold 1.9.6, assinado com o
+#      debug.keystore do projeto (mesma assinatura dos builds anteriores)
+#   4. deixa o APK pra baixar na página da execução ("Artifacts")
+#
+# Precisa de UM segredo no repositório: GCP_SA_KEY (chave JSON de uma conta
+# de serviço do Google Cloud), porque as imagens do servidor só baixam com
+# login do Google. Passo a passo no BUILD_ANDROID.md.
+#
+# Rodar: aba Actions -> "Build Android" -> Run workflow.
+
+name: Build Android
+
+on:
+  workflow_dispatch:
+
+env:
+  DEFOLD_VERSION: "1.9.6"
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Baixar o projeto
+        uses: actions/checkout@v4
+
+      - name: Instalar Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Login no registro de imagens do Google
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          if [ -z "$GCP_SA_KEY" ]; then
+            echo "::error::Falta o segredo GCP_SA_KEY (veja BUILD_ANDROID.md)"
+            exit 1
+          fi
+          printf '%s' "$GCP_SA_KEY" | docker login -u _json_key --password-stdin https://europe-west1-docker.pkg.dev
+
+      - name: Baixar e compilar o servidor de build (extender)
+        run: |
+          git clone --depth 1 https://github.com/defold/extender.git extender
+          cd extender
+          ./gradlew server:bootJar manifestmergetool:mainJar --no-daemon
+
+      - name: Atender o pedido "android-ndk25" do Defold 1.9.6
+        run: |
+          python3 - <<'EOF'
+          path = "extender/server/configs/application-local-dev-app.yml"
+          text = open(path, encoding="utf8").read()
+          key = "            android-ndk25_sdk36:\n"
+          if key not in text:
+              raise SystemExit("Não achei android-ndk25_sdk36 na config do extender (o formato mudou)")
+          alias = (
+              "            android-ndk25:\n"
+              "                url: http://android-ndk25_sdk36:9000\n"
+              "                instanceId: android-ndk25_sdk36\n"
+          )
+          if "            android-ndk25:\n" not in text:
+              text = text.replace(key, alias + key, 1)
+              open(path, "w", encoding="utf8").write(text)
+          print("ok: android-ndk25 -> android-ndk25_sdk36")
+          EOF
+
+      - name: Subir o servidor de build
+        run: |
+          cd extender
+          docker compose -p extender -f server/docker/docker-compose.yml --profile android pull
+          docker compose -p extender -f server/docker/docker-compose.yml --profile android up -d --pull never
+          echo "Esperando o servidor responder..."
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://localhost:9000; then
+              echo "Servidor no ar"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::O servidor de build não respondeu"
+          docker compose -p extender -f server/docker/docker-compose.yml --profile android logs --tail 200
+          exit 1
+
+      - name: Baixar o bob.jar do Defold ${{ env.DEFOLD_VERSION }}
+        run: curl -fL -o bob.jar "https://github.com/defold/defold/releases/download/${DEFOLD_VERSION}/bob.jar"
+
+      - name: Montar o APK
+        run: |
+          printf 'android' > keystore_pass.txt
+          java -jar bob.jar \
+            --platform arm64-android \
+            --architectures arm64-android \
+            --archive \
+            --variant release \
+            --bundle-format apk \
+            --bundle-output build/bundle \
+            --build-server http://localhost:9000 \
+            --keystore debug.keystore \
+            --keystore-pass keystore_pass.txt \
+            --keystore-alias androiddebugkey \
+            --key-pass keystore_pass.txt \
+            resolve distclean build bundle
+
+      - name: Log do servidor (se der erro)
+        if: failure()
+        run: docker compose -p extender -f extender/server/docker/docker-compose.yml --profile android logs --tail 300 || true
+
+      - name: Disponibilizar o APK pra baixar
+        uses: actions/upload-artifact@v4
+        with:
+          name: PokedexPMP-android
+          path: build/bundle/**/*.apk
+          if-no-files-found: error
